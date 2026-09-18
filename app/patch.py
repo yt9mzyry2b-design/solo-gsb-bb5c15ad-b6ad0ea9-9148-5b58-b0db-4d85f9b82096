@@ -2,7 +2,10 @@
 
 The :func:`apply_patch` entry point runs a list of ``add`` / ``remove`` /
 ``replace`` / ``test`` operations against a *deep copy* of the document, in
-array order. Two failure classes are distinguished:
+array order. :func:`apply_patch_with_inverse` does the same and additionally
+returns the inverse operations: applied to the result in the returned order
+they reconstruct the original document exactly. Two failure classes are
+distinguished:
 
 * :class:`PatchStructureError` -- the request itself is invalid (malformed
   operation object, bad JSON Pointer syntax, illegal array-index token); the
@@ -12,6 +15,11 @@ array order. Two failure classes are distinguished:
   fails); the service answers ``409`` and reports ``failed_index``/``path``/
   ``reason``. Since the operations execute on a deep copy, a conflict never
   leaks partially applied results.
+
+Inverse operations are generated from the *real pre-operation value* of each
+mutation (deep-captured before it touches the document), so object
+overwrites, ``/-`` appends and array index shifts all invert exactly. A
+``test`` operation only validates and never contributes an inverse.
 """
 
 from __future__ import annotations
@@ -189,8 +197,26 @@ def apply_patch(document: Any, operations: list) -> Any:
     Returns the resulting document. Raises :class:`PatchStructureError` for a
     bad request and :class:`PatchConflict` when a valid request cannot apply.
     """
+    result, _ = apply_patch_with_inverse(document, operations)
+    return result
+
+
+def apply_patch_with_inverse(document: Any, operations: list) -> tuple[Any, list]:
+    """Like :func:`apply_patch`, also returning inverse operations.
+
+    The second return value is a list of RFC 6902 operations which, applied
+    to the returned document in the given order, reconstruct exactly the
+    original ``document``. Each inverse is derived from the value present
+    *immediately before* its forward operation (deep-captured then), never
+    from the original document or the operation's own ``value``; this makes
+    object overwrites and array index shifts invertible. ``test`` operations
+    only validate and produce no inverse.
+    """
     _check_structure(operations)
     result = deepcopy(document)
+    # One inverse per mutation, accumulated in forward-execution order and
+    # reversed before returning so undoing is a plain in-order /patch run.
+    inverses: list[dict] = []
 
     for index, op in enumerate(operations):
         name = op["op"]
@@ -201,12 +227,18 @@ def apply_patch(document: Any, operations: list) -> Any:
         # Operations on the whole document (the root pointer "").
         if not tokens:
             if name == "add":
+                inverses.append(
+                    {"op": "replace", "path": "", "value": deepcopy(result)}
+                )
                 result = deepcopy(value)
             elif name == "remove":
                 raise PatchConflict(
                     "'remove' cannot target the whole document", index, path
                 )
             elif name == "replace":
+                inverses.append(
+                    {"op": "replace", "path": "", "value": deepcopy(result)}
+                )
                 result = deepcopy(value)
             else:  # test
                 if not json_equal(result, value):
@@ -227,18 +259,45 @@ def apply_patch(document: Any, operations: list) -> Any:
         token = tokens[-1]
         if isinstance(parent, dict):
             if name == "add":
+                # Adding to an existing member behaves like replace, so its
+                # inverse must restore the overwritten value rather than
+                # remove the member.
+                if token in parent:
+                    inverses.append(
+                        {
+                            "op": "replace",
+                            "path": path,
+                            "value": deepcopy(parent[token]),
+                        }
+                    )
+                else:
+                    inverses.append({"op": "remove", "path": path})
                 parent[token] = deepcopy(value)
             elif name == "remove":
                 if token not in parent:
                     raise PatchConflict(
                         f"object has no key {token!r}", index, path
                     )
+                inverses.append(
+                    {
+                        "op": "add",
+                        "path": path,
+                        "value": deepcopy(parent[token]),
+                    }
+                )
                 del parent[token]
             elif name == "replace":
                 if token not in parent:
                     raise PatchConflict(
                         f"object has no key {token!r}", index, path
                     )
+                inverses.append(
+                    {
+                        "op": "replace",
+                        "path": path,
+                        "value": deepcopy(parent[token]),
+                    }
+                )
                 parent[token] = deepcopy(value)
             else:  # test
                 if token not in parent:
@@ -255,7 +314,7 @@ def apply_patch(document: Any, operations: list) -> Any:
             i = _array_index(token, index, path, for_add=(name == "add"))
             if name == "add":
                 if i == -1:
-                    parent.append(deepcopy(value))
+                    i = len(parent)
                 elif i > len(parent):
                     raise PatchConflict(
                         f"array index {i} out of bounds for insertion "
@@ -263,8 +322,13 @@ def apply_patch(document: Any, operations: list) -> Any:
                         index,
                         path,
                     )
-                else:
-                    parent.insert(i, deepcopy(value))
+                # Undoing an insertion removes the concrete slot it landed
+                # in ('/-' included), which is the right slot once later
+                # operations are undone first.
+                inverses.append(
+                    {"op": "remove", "path": f"{traversed}/{i}"}
+                )
+                parent.insert(i, deepcopy(value))
             else:
                 if i >= len(parent):
                     raise PatchConflict(
@@ -273,8 +337,22 @@ def apply_patch(document: Any, operations: list) -> Any:
                         path,
                     )
                 if name == "remove":
+                    inverses.append(
+                        {
+                            "op": "add",
+                            "path": f"{traversed}/{i}",
+                            "value": deepcopy(parent[i]),
+                        }
+                    )
                     del parent[i]
                 elif name == "replace":
+                    inverses.append(
+                        {
+                            "op": "replace",
+                            "path": f"{traversed}/{i}",
+                            "value": deepcopy(parent[i]),
+                        }
+                    )
                     parent[i] = deepcopy(value)
                 else:  # test
                     if not json_equal(parent[i], value):
@@ -290,4 +368,5 @@ def apply_patch(document: Any, operations: list) -> Any:
                 path,
             )
 
-    return result
+    inverses.reverse()
+    return result, inverses

@@ -1,6 +1,6 @@
-# JSON Merge, Patch, Diff, Validate, Redact & Canonicalize Service
+# JSON Merge, Patch, Patch-Invert, Diff, Validate, Redact & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供六个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供七个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -8,6 +8,11 @@
 - `POST /patch`：接收 `document` 与 `operations`，按数组顺序在**深拷贝**上原子
   执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch 的
   `add`、`remove`、`replace`、`test` 操作。
+- `POST /patch/invert`：请求与 `/patch` 完全相同；成功时除处理后的 `document`
+  外再返回 `inverse_operations`，把它按返回顺序交给 `/patch` 即可**精确恢复原
+  文档**。逆操作基于每一步执行前的真实值生成，正确处理对象覆盖、`/-` 追加与
+  数组索引位移；`test` 只校验、不进入逆序列。失败时沿用 `/patch` 的
+  `409`/`422` 结构，不返回部分结果。
 - `POST /diff`：接收任意 JSON 值 `source` 与 `target`，返回把 source 变为
   target 所需的 RFC 6902 `operations`，可直接原样交给 `/patch`；对象按成员递归
   比较，数组按最长公共子序列对齐，公共位置继续递归而非整段替换。
@@ -174,6 +179,87 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 路径按 RFC 6901 以 `/` 分隔；键名中的特殊字符用 `~1` 表示 `/`、`~0` 表示
 `~`（先解 `~1` 再解 `~0`）。空字符串 `""` 指向整个文档。例如键 `a/b`写作
 `/a~1b`，键 `~x` 写作 `/~0x`。
+
+### `POST /patch/invert`
+
+请求体与 `/patch` **完全相同**（同样的 `document` 与 `operations`，同样的
+原子语义与深拷贝）；区别在于成功响应除处理后的 `document` 外，还带一份
+`inverse_operations`：
+
+```json
+{
+  "document": { "a": [1, 2, 3], "b": 30, "c": "new" },
+  "inverse_operations": [
+    { "op": "remove",  "path": "/c" },
+    { "op": "replace", "path": "/b", "value": 3 },
+    { "op": "remove",  "path": "/a/2" }
+  ]
+}
+```
+
+把 `inverse_operations` **按返回顺序**原样交给 `/patch`（作用于返回的
+`document`），得到的文档与原始 `document` **逐字节等价**：
+
+```bash
+curl -s -X POST http://localhost:8000/patch/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":[1,2],"b":3},
+       "operations":[{"op":"test","path":"/b","value":3},
+                     {"op":"add","path":"/a/-","value":3},
+                     {"op":"replace","path":"/b","value":30},
+                     {"op":"add","path":"/c","value":"new"}]}'
+# 再用返回的 inverse_operations 回滚：
+# POST /patch {"document": <上面的 document>, "operations": <上面的 inverse_operations>}
+# => {"document":{"a":[1,2],"b":3}}
+```
+
+#### 逆操作生成规则
+
+逆操作在**正向执行过程中同步记录**，每一条变更恰好对应一条逆操作；记录时使用
+该步**执行前那一时刻的真实值**（深拷贝捕获），然后整体逆序返回。因此逆序列按
+顺序应用时，每一条都面对与原操作相同的数组下标与对象成员。
+
+| 正向操作 | 逆操作 | 说明 |
+| -------- | ------ | ---- |
+| 对象上 `add` 新键 | `remove` 同一路径 | |
+| 对象上 `add` 已存在键 | `replace` 同一路径，值为被覆盖的旧值 | add 命中已有成员时等价于 replace，逆操作必须还原旧值而非删键 |
+| 对象上 `remove` 键 | `add` 同一路径，值为被删除的旧值 | |
+| 对象上 `replace` | `replace` 同一路径，值为旧值 | 即使整个子树被覆盖，旧子树也完整保留在逆操作里 |
+| 数组 `add`（含 `/i` 插入与 `/-` 追加） | `remove` **具体落点下标** | `/-` 记录为追加时的实际索引（如长度 2 上追加记录 `/2`） |
+| 数组 `remove /i` | `add /i`，值为被删元素 | |
+| 数组 `replace /i` | `replace /i`，值为旧元素 | |
+| 根路径 `add` / `replace`（`""`） | 根路径 `replace`，值为整个原文档 | |
+| `test` | **无** | 只参与校验，不修改文档，因此不进入逆序列 |
+
+要点：
+
+- **对象覆盖**：`replace`/覆盖式 `add` 会把被覆盖的值（无论多深）深拷贝进逆
+  操作；即使后续操作又改了内部路径，回滚也会先撤销内部修改、再还原整体。
+- **`/-` 追加**：逆操作把 `-` 具体化为追加那一刻的索引，删除的就是当初追加的
+  元素。
+- **数组索引位移**：插入/删除都以执行前的真实下标记录，逆序列整体逆序应用，
+  因此后发生的位移先被撤销，先前记录的下标仍然精确。
+- **逐步真实值**：同一路径连续多次修改时，逆操作依次还原每一步之前的值，而不
+  是统一回到最初文档。
+- `operations` 为空时返回 `{"document": <原样>, "inverse_operations": []}`；
+  只有 `test` 的请求逆序列也是 `[]`。
+
+#### 失败响应
+
+与 `/patch` 完全一致——结构非法（坏指针、缺字段、非 `add` 使用 `-` 等）返回
+`422`，路径不存在、数组越界、`test` 失败返回 `409`，响应体字段同为
+`detail` / `failed_index` / `path` / `reason`。**任一步失败都不返回
+`document` 或 `inverse_operations`**（变更全部作用于深拷贝，原始请求文档不受
+影响）：
+
+```json
+{
+  "detail": "patch conflict",
+  "failed_index": 1,
+  "path": "/missing",
+  "reason": "object has no key 'missing'"
+}
+```
 
 ### `POST /diff`
 
@@ -554,6 +640,27 @@ curl -s -X POST http://localhost:8000/patch \
   -d '{"document":{"a":1},"operations":[{"op":"add","path":"/b","value":2},{"op":"test","path":"/a","value":99}]}'
 # => 409 {"detail":"patch conflict","failed_index":1,"path":"/a","reason":"test failed: ..."}
 
+# patch/invert：返回结果文档与逆操作（test 不出现在 inverse_operations 中）
+curl -s -X POST http://localhost:8000/patch/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":[1,2],"b":3},"operations":[{"op":"add","path":"/a/-","value":3},{"op":"replace","path":"/b","value":30}]}'
+# => {"document":{"a":[1,2,3],"b":30},
+#     "inverse_operations":[{"op":"replace","path":"/b","value":3},
+#                           {"op":"remove","path":"/a/2"}]}
+
+# patch/invert：/- 追加具体化为落点下标，数组插入/删除的位移在逆序应用时精确还原
+curl -s -X POST http://localhost:8000/patch/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"document":[1,2],"operations":[{"op":"add","path":"/0","value":"a"},{"op":"remove","path":"/2"}]}'
+# => {"document":["a",1],"inverse_operations":[{"op":"add","path":"/2","value":2},
+#                                              {"op":"remove","path":"/0"}]}
+
+# patch/invert 失败：沿用 /patch 的 409 结构，不返回部分结果
+curl -s -X POST http://localhost:8000/patch/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":1},"operations":[{"op":"add","path":"/b","value":2},{"op":"remove","path":"/missing"}]}'
+# => 409 {"detail":"patch conflict","failed_index":1,"path":"/missing","reason":"..."}
+
 # 生成 diff（返回的 operations 可直接交给 /patch）
 curl -s -X POST http://localhost:8000/diff \
   -H 'Content-Type: application/json' \
@@ -635,8 +742,8 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch、/diff、/validate、/redact 与 /canonicalize 入口
-app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
+app/main.py           # FastAPI 应用：/merge、/patch、/patch/invert、/diff、/validate、/redact 与 /canonicalize 入口
+app/patch.py          # RFC 6902 JSON Patch 校验与原子执行，并生成精确逆操作
 app/diff.py           # RFC 6902 diff 生成：对象递归比较、数组 LCS 对齐
 app/validate.py       # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
 app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
@@ -644,6 +751,7 @@ app/redact.py         # JSON Pointer glob 匹配、命中裁决与脱敏动作�
 app/jsonutil.py       # JSON 相等性、MISSING 哨兵与 RFC 6901 转义（接口共用）
 tests/test_merge.py        # /merge 测试
 tests/test_patch.py        # /patch 测试
+tests/test_patch_invert.py # /patch/invert 测试（含逆操作回滚、位移与覆盖场景）
 tests/test_diff.py         # /diff 测试（含 diff→/patch 随机往返）
 tests/test_validate.py     # /validate 测试
 tests/test_canonicalize.py # /canonicalize 测试
