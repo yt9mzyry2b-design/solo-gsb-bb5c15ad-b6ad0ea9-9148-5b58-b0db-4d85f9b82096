@@ -1,6 +1,6 @@
 # JSON Merge, Patch, Diff, Validate, Redact & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供六个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供七个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -8,6 +8,9 @@
 - `POST /patch`：接收 `document` 与 `operations`，按数组顺序在**深拷贝**上原子
   执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch 的
   `add`、`remove`、`replace`、`test` 操作。
+- `POST /patch/invert`：请求格式、原子语义与错误结构同 `/patch`，成功时额外
+  返回 `inverse_operations`——按返回顺序逐条应用到结果文档即可精确恢复原文档；
+  逆操作基于每一步执行前的真实值生成，`test` 不进入逆序列。
 - `POST /diff`：接收任意 JSON 值 `source` 与 `target`，返回把 source 变为
   target 所需的 RFC 6902 `operations`，可直接原样交给 `/patch`；对象按成员递归
   比较，数组按最长公共子序列对齐，公共位置继续递归而非整段替换。
@@ -174,6 +177,55 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 路径按 RFC 6901 以 `/` 分隔；键名中的特殊字符用 `~1` 表示 `/`、`~0` 表示
 `~`（先解 `~1` 再解 `~0`）。空字符串 `""` 指向整个文档。例如键 `a/b`写作
 `/a~1b`，键 `~x` 写作 `/~0x`。
+
+### `POST /patch/invert`
+
+请求体与 `/patch` 完全相同（`document` + `operations`），校验规则、原子性与
+错误响应也完全一致；差别只在成功时的响应多一个 `inverse_operations` 字段：
+
+```bash
+curl -s -X POST http://localhost:8000/patch/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":[1,2],"b":3},
+       "operations":[{"op":"add","path":"/a/-","value":3},
+                     {"op":"replace","path":"/b","value":30}]}'
+```
+
+```json
+{
+  "document": { "a": [1, 2, 3], "b": 30 },
+  "inverse_operations": [
+    { "op": "replace", "path": "/b",   "value": 3 },
+    { "op": "remove",  "path": "/a/2" }
+  ]
+}
+```
+
+`inverse_operations` 满足：**把它按返回顺序逐条应用到本次返回的 `document`
+上（例如直接作为 `/patch` 的 `operations` 提交），结果与原始 `document`
+完全相等**。
+
+逆操作生成规则（基于每一步**执行前**的真实值）：
+
+| 原操作                            | 对应的逆操作                                 |
+| --------------------------------- | -------------------------------------------- |
+| `add` 到不存在的对象键            | `remove` 该键                                |
+| `add` 覆盖已存在的对象键          | `replace` 回执行前的旧值                     |
+| `add` 数组插入（含 `/-` 追加）    | `remove` 插入位置（`/-` 解析为实际数字索引） |
+| `remove`                          | `add` 回执行前的旧值（同一路径/索引）        |
+| `replace`                         | `replace` 回执行前的旧值                     |
+| `test`                            | 不生成逆操作（仅参与校验）                   |
+
+- 逆序列按**撤销顺序**返回：后执行的操作排在前面先撤销，因此数组插入/删除
+  造成的索引位移会被正确还原。
+- 逆操作中的旧值均为深拷贝，此后对结果文档的任何修改都不会影响它。
+- 返回的 `inverse_operations` 本身也是合法的 RFC 6902 操作列表，可直接作为
+  `/patch` 或 `/patch/invert` 的 `operations` 再次提交。
+
+**失败时与 `/patch` 完全相同**：结构非法 → `422`（`invalid patch
+operation`），路径无法解析 / 数组越界 / `test` 失败 → `409`（`patch
+conflict`），均带 `failed_index` / `path` / `reason`，且不返回任何部分结果
+（响应中既没有 `document` 也没有 `inverse_operations`）。
 
 ### `POST /diff`
 
@@ -635,8 +687,8 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch、/diff、/validate、/redact 与 /canonicalize 入口
-app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
+app/main.py           # FastAPI 应用：/merge、/patch、/patch/invert、/diff、/validate、/redact 与 /canonicalize 入口
+app/patch.py          # RFC 6902 JSON Patch 校验、原子执行与逆操作推导
 app/diff.py           # RFC 6902 diff 生成：对象递归比较、数组 LCS 对齐
 app/validate.py       # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
 app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
@@ -644,6 +696,7 @@ app/redact.py         # JSON Pointer glob 匹配、命中裁决与脱敏动作�
 app/jsonutil.py       # JSON 相等性、MISSING 哨兵与 RFC 6901 转义（接口共用）
 tests/test_merge.py        # /merge 测试
 tests/test_patch.py        # /patch 测试
+tests/test_patch_invert.py # /patch/invert 测试
 tests/test_diff.py         # /diff 测试（含 diff→/patch 随机往返）
 tests/test_validate.py     # /validate 测试
 tests/test_canonicalize.py # /canonicalize 测试

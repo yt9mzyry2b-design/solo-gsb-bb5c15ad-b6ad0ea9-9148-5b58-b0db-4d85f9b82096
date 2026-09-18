@@ -17,6 +17,14 @@
   unresolvable paths, out-of-bounds array indices and failed ``test``
   operations yield 409 without any partial result.
 
+* ``POST /patch/invert`` accepts the same request as ``/patch`` and applies
+  it with the same atomic semantics, but the success response additionally
+  carries ``inverse_operations``: the operations that, applied to the
+  returned document in response order, restore the original document
+  exactly. Each inverse is derived from the value present immediately
+  before its operation ran; ``test`` operations contribute nothing.
+  Failures produce the same 409/422 responses as ``/patch``.
+
 * ``POST /diff`` accepts ``{"source": ..., "target": ...}`` and returns the
   RFC 6902 ``operations`` that transform source into target; objects are
   compared recursively by member (RFC 6901 escaping included) and arrays are
@@ -57,13 +65,18 @@ from pydantic import BaseModel, Field
 from .canonicalize import CanonicalizationError, canonicalize
 from .diff import make_patch
 from .jsonutil import MISSING, escape_pointer, json_equal
-from .patch import PatchConflict, PatchStructureError, apply_patch
+from .patch import (
+    PatchConflict,
+    PatchStructureError,
+    apply_patch,
+    apply_patch_invertible,
+)
 from .redact import RedactConflict, RedactStructureError, apply_redactions
 from .validate import SchemaValidationError, build_validator, leaf_errors
 
 app = FastAPI(
     title="JSON Merge, Patch, Diff, Validate, Redact & Canonicalize Service",
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -179,6 +192,35 @@ def patch_endpoint(request: PatchRequest):
             content["path"] = exc.path
         return JSONResponse(status_code=422, content=content)
     return {"document": document}
+
+
+@app.post("/patch/invert")
+def patch_invert_endpoint(request: PatchRequest):
+    try:
+        document, inverse_operations = apply_patch_invertible(
+            request.document, request.operations
+        )
+    except PatchConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "patch conflict",
+                "failed_index": exc.index,
+                "path": exc.path,
+                "reason": exc.reason,
+            },
+        )
+    except PatchStructureError as exc:
+        content: dict = {
+            "detail": "invalid patch operation",
+            "reason": exc.reason,
+        }
+        if exc.index >= 0:
+            content["failed_index"] = exc.index
+        if isinstance(exc.path, str):
+            content["path"] = exc.path
+        return JSONResponse(status_code=422, content=content)
+    return {"document": document, "inverse_operations": inverse_operations}
 
 
 class DiffRequest(BaseModel):
